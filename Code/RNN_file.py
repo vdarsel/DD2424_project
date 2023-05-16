@@ -83,7 +83,7 @@ def Generate_Random_RNN_music(RNN_music_network: RNN_music, K: int, m :int):
     RNN_music_network.init_matrix(b,c,W,V,U)
     return RNN_music_network
 
-def Generate_music(RNN_music_network : RNN_music, n :int, starting_situation: np.ndarray):
+def Generate_music(RNN_music_network : RNN_music, n :int, starting_situation: np.ndarray, name: str):
     res = np.zeros((RNN_music_network.K,n,1),int)
     h0 = RNN_music_network.h0
     vec_x = starting_situation.reshape((len(starting_situation),1))
@@ -102,7 +102,7 @@ def Generate_music(RNN_music_network : RNN_music, n :int, starting_situation: np
         # print("X 2:",vec_x.shape)
         res[:,t] = vec_x.copy()
     n_file = len(listdir("Generated_music/"))
-    np.savetxt("Generated_music/"+str(n_file)+"_length_"+str(n)+".csv")
+    np.savetxt("Generated_music/"+name+str(n_file)+"_length_"+str(n)+".csv",res.reshape(RNN_music_network.K,n),"%i")
     return res
 
 ########################################################
@@ -115,6 +115,12 @@ def ComputeGradiant(RNN_music_network : RNN_music, X: np.ndarray, Y: np.ndarray)
     # print("G:",G.shape)
     # print("Y:",Y.shape)
     # print("p:",RNN_music_network.p.shape)
+    # max_gradV = 1e5*np.ones_like(gradV)
+    # max_gradc = 1e5*np.ones_like(gradc)
+    # max_gradb = 1e5*np.ones_like(gradb)
+    # max_gradW = 1e5*np.ones_like(gradW)
+    # max_gradU = 1e5*np.ones_like(gradU)
+    max_dL_d_t = 1e3*np.ones((RNN_music_network.m,1))
     gradV = np.sum([G[:,t].dot(np.transpose(RNN_music_network.h[:,t])) for t in range(tau)], axis=0)
     gradc = np.sum([G[:,t] for t in range(tau)], axis=0)
     gradW = np.zeros((RNN_music_network.m,RNN_music_network.m))
@@ -122,8 +128,8 @@ def ComputeGradiant(RNN_music_network : RNN_music, X: np.ndarray, Y: np.ndarray)
     gradU = np.zeros((RNN_music_network.m,RNN_music_network.K))
     residual = np.zeros((RNN_music_network.m,1))
     for t in range(tau-1,0,-1):
-        dL_dht = np.transpose(RNN_music_network.V).dot(G[:,t]) + residual
-        dL_dat = dL_dht*(1-np.power(RNN_music_network.h[:,t],2))
+        dL_dht = np.min([np.max([np.transpose(RNN_music_network.V).dot(G[:,t]) + residual,-max_dL_d_t], axis=0),max_dL_d_t], axis=0)
+        dL_dat = np.min([np.max([dL_dht*(1-np.power(RNN_music_network.h[:,t],2)),max_dL_d_t], axis=0),max_dL_d_t], axis=0)
         gradb += dL_dat
         gradW += dL_dat.dot(np.transpose(RNN_music_network.h[:,t-1]))
         gradU += dL_dat.dot(np.transpose(X[:,[t]]))
@@ -374,8 +380,74 @@ def Adam(RNN_music_network: RNN_music, path_file_array: np.ndarray, time_batch: 
                 if ((batch_count)%100==0):
                     print("After "+str(batch_count)+" updates, loss:",smooth_loss)
                 if ((batch_count)%1000==0):
-                    musics.append((Generate_music(RNN_music_network,200,X_batch[:,0])))
+                    musics.append((Generate_music(RNN_music_network,200,X_batch[:,0],str(batch_count)+"_it")))
     return loss,musics
+
+
+def Adam_one_file(RNN_music_network: RNN_music, path_file: np.ndarray, time_batch: float, n_epoch: int, eta: float, beta_1: float = .9, beta_2: float = 0.999, eps: float = 1e-8):
+    loss=[]
+    musics = []
+    ## initial loss
+    music_file = pyd.PrettyMIDI(path_file)
+    X = convert_to_2D(music_file,RNN_music_network.min_pitch,RNN_music_network.max_pitch)
+    batch_count = 0
+    ending_time = music_file.get_end_time()
+    for i in range(n_epoch):
+        # end_tick = music_file.time_to_tick()
+        initial_offset = np.random.rand()*(ending_time%time_batch)
+        n_batch = int(ending_time//time_batch)
+        t = initial_offset + time_batch*np.arange(n_batch+1)
+        tick_limit_batch = np.array([music_file.time_to_tick(i) for i in t])
+        order = np.arange(n_batch)
+        np.random.shuffle(order)
+        for k in order:
+            batch_count+=1
+            tick_init_batch = tick_limit_batch[k]
+            tick_end_batch = tick_limit_batch[k+1]
+            X_batch = X[:,tick_init_batch:tick_end_batch]
+            Y_batch = X[:,tick_init_batch+1:tick_end_batch+1]
+            # t=time()
+            RNN_music_network.forward_pass(X_batch)
+            # print(time()-t)
+            # t = time()
+            grads = ComputeGradiant(RNN_music_network,X_batch,Y_batch)
+            # print(time()-t)
+            # t = time()
+            m_s = []
+            v_s = []
+            for l in range(len(grads)):
+                RNN_music_network.m_s[l] = beta_1* RNN_music_network.m_s[l] + (1-beta_1) * grads[l]
+                RNN_music_network.v_s[l] = beta_2* RNN_music_network.v_s[l] + (1-beta_2) * np.power(grads[l],2)
+                m_s.append(RNN_music_network.m_s[l]/(1-np.power(beta_1,i+1)))
+                v_s.append(RNN_music_network.v_s[l]/(1-np.power(beta_2,i+1)))
+            # print(time()-t)
+            # t = time()
+            RNN_music_network.b -= eta/(np.sqrt(v_s[0])+RNN_music_network.eps)*m_s[0]
+            RNN_music_network.c -= eta/(np.sqrt(v_s[1])+RNN_music_network.eps)*m_s[1]
+            RNN_music_network.W -= eta/(np.sqrt(v_s[2])+RNN_music_network.eps)*m_s[2]
+            RNN_music_network.V -= eta/(np.sqrt(v_s[3])+RNN_music_network.eps)*m_s[3]
+            RNN_music_network.U -= eta/(np.sqrt(v_s[4])+RNN_music_network.eps)*m_s[4]
+            # print("before end batch, h0:",RNN_music_network.h0.shape)
+            RNN_music_network.h0 = RNN_music_network.h[:,-1].copy()
+            # print("end batch, h0:",RNN_music_network.h0.shape)
+            # print(time()-t)
+            # t = time()
+            if(batch_count==1):
+                smooth_loss = RNN_music_network.compute_loss(Y_batch)
+            else:
+                temp = RNN_music_network.compute_loss(Y_batch)
+                if (np.isnan(temp)):
+                    print(np.min(RNN_music_network.p),np.max(RNN_music_network.p))
+                smooth_loss = 0.999*smooth_loss + 0.001*RNN_music_network.compute_loss(Y_batch)
+            # print(time()-t)
+            # t = time()
+            loss.append(smooth_loss)
+            if ((batch_count)%100==0):
+                print("After "+str(batch_count)+" updates, loss:",smooth_loss)
+            if ((batch_count)%1000==0):
+                musics.append((Generate_music(RNN_music_network,200,X_batch[:,0],str(batch_count)+"_it_from_"+path_file.split("/")[-1])))
+    return loss,musics
+
 
 
 def convert_to_2D(analyze_file : pyd.PrettyMIDI, min_pitch: int, max_pitch: int):
